@@ -62,7 +62,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 		if err != nil {
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, nil), nil
+		return encoding.NewMultiHunkConn(grpcService, nil, nil), nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
@@ -71,7 +71,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, nil), nil
+	return encoding.NewHunkConn(grpcService, nil, nil), nil
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
@@ -191,8 +191,16 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	)
 	if err == nil {
 		userAgent := grpcSettings.UserAgent
-		if userAgent == "" {
+		// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
+		switch userAgent {
+		case "chrome", "":
 			userAgent = utils.ChromeUA
+		case "firefox":
+			userAgent = utils.FirefoxUA
+		case "edge":
+			userAgent = utils.MSEdgeUA
+		case "golang":
+			userAgent = ""
 		}
 		setUserAgent(conn, userAgent)
 		conn.Connect()

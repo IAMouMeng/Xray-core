@@ -4,12 +4,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -51,12 +54,9 @@ func (c *Config) GetRequestHeader() http.Header {
 	for k, v := range c.Headers {
 		header.Add(k, v)
 	}
-	if header.Get("User-Agent") == "" {
-		header.Set("User-Agent", utils.ChromeUA)
-	}
+	utils.TryDefaultHeadersWith(header, "fetch")
 	return header
 }
-
 
 func (c *Config) GetRequestHeaderWithPayload(payload []byte) http.Header {
 	header := c.GetRequestHeader()
@@ -102,9 +102,9 @@ func (c *Config) WriteResponseHeader(writer http.ResponseWriter, requestMethod s
 	}
 
 	if c.GetNormalizedSessionPlacement() == PlacementCookie ||
-	   c.GetNormalizedSeqPlacement() == PlacementCookie ||
-	   c.XPaddingPlacement == PlacementCookie ||
-	   c.GetNormalizedUplinkDataPlacement() == PlacementCookie {
+		c.GetNormalizedSeqPlacement() == PlacementCookie ||
+		c.XPaddingPlacement == PlacementCookie ||
+		c.GetNormalizedUplinkDataPlacement() == PlacementCookie {
 		writer.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
@@ -133,26 +133,26 @@ func (c *Config) GetNormalizedUplinkHTTPMethod() string {
 	return c.UplinkHTTPMethod
 }
 
-func (c *Config) GetNormalizedScMaxEachPostBytes() RangeConfig {
+func (c *Config) GetNormalizedScMaxEachPostBytes() *RangeConfig {
 	if c.ScMaxEachPostBytes == nil || c.ScMaxEachPostBytes.To == 0 {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 1000000,
 			To:   1000000,
 		}
 	}
 
-	return *c.ScMaxEachPostBytes
+	return c.ScMaxEachPostBytes
 }
 
-func (c *Config) GetNormalizedScMinPostsIntervalMs() RangeConfig {
+func (c *Config) GetNormalizedScMinPostsIntervalMs() *RangeConfig {
 	if c.ScMinPostsIntervalMs == nil || c.ScMinPostsIntervalMs.To == 0 {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 30,
 			To:   30,
 		}
 	}
 
-	return *c.ScMinPostsIntervalMs
+	return c.ScMinPostsIntervalMs
 }
 
 func (c *Config) GetNormalizedScMaxBufferedPosts() int {
@@ -163,27 +163,27 @@ func (c *Config) GetNormalizedScMaxBufferedPosts() int {
 	return int(c.ScMaxBufferedPosts)
 }
 
-func (c *Config) GetNormalizedScStreamUpServerSecs() RangeConfig {
+func (c *Config) GetNormalizedScStreamUpServerSecs() *RangeConfig {
 	if c.ScStreamUpServerSecs == nil || c.ScStreamUpServerSecs.To == 0 {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 20,
 			To:   80,
 		}
 	}
 
-	return *c.ScStreamUpServerSecs
+	return c.ScStreamUpServerSecs
 }
 
-func (c *Config) GetNormalizedUplinkChunkSize() RangeConfig {
+func (c *Config) GetNormalizedUplinkChunkSize() *RangeConfig {
 	if c.UplinkChunkSize == nil || c.UplinkChunkSize.To == 0 {
 		switch c.UplinkDataPlacement {
 		case PlacementCookie:
-			return RangeConfig{
+			return &RangeConfig{
 				From: 2 * 1024, // 2 KiB
 				To:   3 * 1024, // 3 KiB
 			}
 		case PlacementHeader:
-			return RangeConfig{
+			return &RangeConfig{
 				From: 3 * 1000, // 3 KB
 				To:   4 * 1000, // 4 KB
 			}
@@ -191,13 +191,13 @@ func (c *Config) GetNormalizedUplinkChunkSize() RangeConfig {
 			return c.GetNormalizedScMaxEachPostBytes()
 		}
 	} else if c.UplinkChunkSize.From < 64 {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 64,
 			To:   max(64, c.UplinkChunkSize.To),
 		}
 	}
 
-	return *c.UplinkChunkSize
+	return c.UplinkChunkSize
 }
 
 func (c *Config) GetNormalizedServerMaxHeaderBytes() int {
@@ -209,10 +209,10 @@ func (c *Config) GetNormalizedServerMaxHeaderBytes() int {
 }
 
 func (c *Config) GetNormalizedSessionPlacement() string {
-	if c.SessionPlacement == "" {
+	if c.SessionIDPlacement == "" {
 		return PlacementPath
 	}
-	return c.SessionPlacement
+	return c.SessionIDPlacement
 }
 
 func (c *Config) GetNormalizedSeqPlacement() string {
@@ -230,8 +230,8 @@ func (c *Config) GetNormalizedUplinkDataPlacement() string {
 }
 
 func (c *Config) GetNormalizedSessionKey() string {
-	if c.SessionKey != "" {
-		return c.SessionKey
+	if c.SessionIDKey != "" {
+		return c.SessionIDKey
 	}
 	switch c.GetNormalizedSessionPlacement() {
 	case PlacementHeader:
@@ -324,22 +324,17 @@ func (c *Config) FillStreamRequest(request *http.Request, sessionId string, seqS
 	}
 }
 
-func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqStr string) error {
+func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) error {
 	dataPlacement := c.GetNormalizedUplinkDataPlacement()
 
 	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
 		request.Header = c.GetRequestHeader()
+		request.Body = io.NopCloser(&buf.MultiBufferContainer{MultiBuffer: payload})
+		request.ContentLength = int64(payload.Len())
 	} else {
-		var data []byte
-		var err error
-		if request.Body != nil {
-			data, err = io.ReadAll(request.Body)
-			if err != nil {
-				return err
-			}
-		}
-		request.Body = nil
-		request.ContentLength = 0
+		data := make([]byte, payload.Len())
+		payload.Copy(data)
+		buf.ReleaseMulti(payload)
 		switch dataPlacement {
 		case PlacementHeader:
 			request.Header = c.GetRequestHeaderWithPayload(data)
@@ -424,59 +419,59 @@ func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (session
 	return sessionId, seqStr
 }
 
-func (m *XmuxConfig) GetNormalizedMaxConcurrency() RangeConfig {
+func (m *XmuxConfig) GetNormalizedMaxConcurrency() *RangeConfig {
 	if m.MaxConcurrency == nil {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 0,
 			To:   0,
 		}
 	}
 
-	return *m.MaxConcurrency
+	return m.MaxConcurrency
 }
 
-func (m *XmuxConfig) GetNormalizedMaxConnections() RangeConfig {
+func (m *XmuxConfig) GetNormalizedMaxConnections() *RangeConfig {
 	if m.MaxConnections == nil {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 0,
 			To:   0,
 		}
 	}
 
-	return *m.MaxConnections
+	return m.MaxConnections
 }
 
-func (m *XmuxConfig) GetNormalizedCMaxReuseTimes() RangeConfig {
+func (m *XmuxConfig) GetNormalizedCMaxReuseTimes() *RangeConfig {
 	if m.CMaxReuseTimes == nil {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 0,
 			To:   0,
 		}
 	}
 
-	return *m.CMaxReuseTimes
+	return m.CMaxReuseTimes
 }
 
-func (m *XmuxConfig) GetNormalizedHMaxRequestTimes() RangeConfig {
+func (m *XmuxConfig) GetNormalizedHMaxRequestTimes() *RangeConfig {
 	if m.HMaxRequestTimes == nil {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 0,
 			To:   0,
 		}
 	}
 
-	return *m.HMaxRequestTimes
+	return m.HMaxRequestTimes
 }
 
-func (m *XmuxConfig) GetNormalizedHMaxReusableSecs() RangeConfig {
+func (m *XmuxConfig) GetNormalizedHMaxReusableSecs() *RangeConfig {
 	if m.HMaxReusableSecs == nil {
-		return RangeConfig{
+		return &RangeConfig{
 			From: 0,
 			To:   0,
 		}
 	}
 
-	return *m.HMaxReusableSecs
+	return m.HMaxReusableSecs
 }
 
 func init() {
@@ -485,8 +480,42 @@ func init() {
 	}))
 }
 
-func (c RangeConfig) rand() int32 {
+func (c *RangeConfig) rand() int32 {
+	if c == nil {
+		return 0
+	}
 	return int32(crypto.RandBetween(int64(c.From), int64(c.To)))
+}
+
+// predefined
+var PredefinedTable = map[string]string{
+	"ALPHABET": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	"Alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+	"BASE36":   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	"Base62":   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+	"HEX":      "0123456789ABCDEF",
+	"alphabet": "abcdefghijklmnopqrstuvwxyz",
+	"base36":   "0123456789abcdefghijklmnopqrstuvwxyz",
+	"hex":      "0123456789abcdef",
+	"number":   "0123456789",
+}
+
+func (c *Config) GenerateSessionID() string {
+	length := c.SessionIDLength.rand()
+	table := c.SessionIDTable
+	if predefined, ok := PredefinedTable[table]; ok {
+		table = predefined
+	}
+	if table != "" && length > 0 {
+		id := make([]byte, length)
+		for i := range id {
+			id[i] = table[rand.N(len(table))]
+		}
+		return string(id)
+	} else {
+		uuid := uuid.New()
+		return uuid.String()
+	}
 }
 
 func appendToPath(path, value string) string {
